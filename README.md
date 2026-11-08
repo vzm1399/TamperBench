@@ -47,4 +47,4 @@ operate only on synthetic logs from a toy sandbox. See Appendix A of the report.
 Code: MIT. Data: CC BY 4.0.
 
 ## Citation
-<author>, "TamperBench", Swarm Alignment Hackathon 2026.
+Vahideh Zolfaghari, "TamperBench", Swarm Alignment Hackathon 2026.
