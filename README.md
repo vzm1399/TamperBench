@@ -1,4 +1,5 @@
 # TamperBench
+The submitted version is release `v0.1-hackathon`.
 
 Post-hoc forensic detection of tampered LLM-agent traces: a benchmark, a detector suite, and an
 analysis of which trusted signals help most.
@@ -97,7 +98,7 @@ The only change after the experiments is the module docstring (comments). The ru
 
 ## Pre-existing code and prior work
 
-<<PRE_EXISTING_STATEMENT>>
+None. The sandbox, task families, tamper operators, detectors (including the D3 probe), evaluation code (tamperbench.py) and the driver (run_all.py) were written during the hackathon weekend; no code from earlier projects was reused. Standard libraries (numpy, scikit-learn, PyTorch, Hugging Face transformers) and the pretrained models Qwen2.5-7B-Instruct and Llama-3.1-8B-Instruct are used as published.
 
 ## Limitations
 
