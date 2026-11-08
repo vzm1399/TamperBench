@@ -113,7 +113,7 @@ sandbox. See the report's dual-use appendix.
 
 ## License
 
-Code: MIT (see `LICENSE`). Data: CC BY 4.0. Data generated with Llama-3.1-8B-Instruct is
+Code: MIT. Data: CC BY 4.0. Data generated with Llama-3.1-8B-Instruct is
 additionally subject to the Llama 3.1 Community License.
 
 ## Author
