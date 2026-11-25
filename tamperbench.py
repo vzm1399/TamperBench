@@ -1627,20 +1627,43 @@ def cmd_detect(args, lm=None):
                 for name, fn in aggs.items():
                     S[vid]["scores"][name] = float(fn(x))
                     S[vid]["budget_scores"][name] = {str(k): float(fn([x[i] for i in budget_sub(vid, len(x), k)])) for k in budgets}
+        d3_oof = {}  # v1.1 (F4): out-of-fold D3 scores of TRAIN rows, used only to fit the D4 fusion
         if "d3" in dets and H:
             # linear probe on the residual stream at the action position. Positive = an edited step or its successor
             # (a falsified result only becomes visible to the model at the NEXT action).
-            Xtr, ytr = [], []
+            Xtr, ytr, spans = [], [], []
             for r in pure:
                 if not is_train(r):
                     continue
                 tp = set(r["tampered_positions"]) | {j + 1 for j in r["tampered_positions"]}
+                a0 = len(Xtr)
                 for j, hv in enumerate(H[r["variant_id"]]):
                     Xtr.append(hv.astype(np.float32))
                     ytr.append(int(j in tp))
+                spans.append((r, a0, len(Xtr)))
             if len(set(ytr)) == 2:
                 sc3 = StandardScaler().fit(np.array(Xtr))
                 clf3 = LogisticRegression(max_iter=500, C=0.05, class_weight="balanced").fit(sc3.transform(np.array(Xtr)), ytr)
+                if getattr(args, "d4_oof", True):
+                    # The probe above scores its own training logs too well. Fitting D4 on those in-sample scores would
+                    # over-trust D3. So: K-fold by task instance (all variants of one task stay together), each train
+                    # log is scored by a probe that never saw its task instance.
+                    from sklearn.model_selection import GroupKFold
+                    groups = [r["cluster"] for r, _, _ in spans]
+                    nspl = min(5, len(set(groups)))
+                    if nspl >= 2:
+                        Xa, ya = np.array(Xtr), np.array(ytr)
+                        for fi_tr, fi_te in GroupKFold(n_splits=nspl).split(np.arange(len(spans)), groups=groups):
+                            idx = np.concatenate([np.arange(spans[k][1], spans[k][2]) for k in fi_tr])
+                            if len(set(ya[idx])) < 2:
+                                continue
+                            scf = StandardScaler().fit(Xa[idx])
+                            clff = LogisticRegression(max_iter=500, C=0.05, class_weight="balanced").fit(scf.transform(Xa[idx]), ya[idx])
+                            for k in fi_te:
+                                r_, a0, a1 = spans[k]
+                                if a1 > a0:
+                                    d3_oof[r_["variant_id"]] = float(np.max(clff.decision_function(scf.transform(Xa[a0:a1]))))
+                        print(f"[detect] D3 out-of-fold scores for {len(d3_oof)}/{len(spans)} train logs ({nspl} folds by task instance)", flush=True)
                 for r in pure:
                     vid = r["variant_id"]
                     dv = clf3.decision_function(sc3.transform(np.array([hv.astype(np.float32) for hv in H[vid]])))
@@ -1654,6 +1677,11 @@ def cmd_detect(args, lm=None):
                 if all(c in S[r["variant_id"]]["scores"] for r in pure)]
         if len(cols) >= 2:
             Xp = np.array([[S[r["variant_id"]]["scores"][c] for c in cols] for r in pure], float)
+            if "d3" in cols and d3_oof:
+                j3 = cols.index("d3")
+                for i_, r_ in enumerate(pure):
+                    if is_train(r_) and r_["variant_id"] in d3_oof:
+                        Xp[i_, j3] = d3_oof[r_["variant_id"]]
             trp = [i for i, r in enumerate(pure) if is_train(r)]
             yp = np.array([int(pure[i]["tampered"]) for i in trp])
             if len(set(yp)) == 2:
@@ -2261,6 +2289,8 @@ def build_parser():
         p.add_argument("--b2-max", type=int, default=1500, help="max variants scored by the LLM judge")
         p.add_argument("--train-types", default="T1,T2,T3,T4")
         p.add_argument("--train-levels", default="0,1,2")
+        p.add_argument("--d4-oof", action=argparse.BooleanOptionalAction, default=True,
+                       help="fit D4 on out-of-fold D3 scores (default). --no-d4-oof reproduces the v1.0 behaviour")
 
     def ev(p):
         p.add_argument("--n-boot", type=int, default=500)
