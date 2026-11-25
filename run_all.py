@@ -37,6 +37,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -85,6 +86,8 @@ ap.add_argument("--ood-family", default="text_transform,drop_header")
 # gates and budget
 ap.add_argument("--min-valid-rate", type=float, default=0.30, help="abort a job if fewer valid episodes than this (saves money)")
 ap.add_argument("--no-gates", action="store_true")
+ap.add_argument("--max-sanity-problems", type=int, default=0,
+                help="abort a job (before detect/evaluate) if tamper reports MORE sanity problems than this (default 0)")
 ap.add_argument("--price", type=float, default=0.59, help="machine price in USD per hour")
 ap.add_argument("--spent-usd", type=float, default=0.0, help="USD already spent BEFORE this driver started")
 ap.add_argument("--cap-usd", type=float, default=18.0, help="hard cap in USD")
@@ -374,6 +377,25 @@ def grow_n(n: int, est: int) -> int:
     return int(min(A.n_max, max(n + A.n_step, want)))
 
 
+def sanity_gate(name: str, tail, js: dict) -> None:
+    """v1.1 (F3): stop before spending GPU time on detect if untampered logs fail their own consistency checks."""
+    found = re.findall(r"sanity problems:\s*(\d+)", "".join(tail))
+    if not found:
+        js["status"] = "aborted_sanity_unreadable"
+        save_state()
+        raise RuntimeError("could not read the sanity-problem count from the tamper output: refusing to continue "
+                           "(re-run tamper; see the tamper log)")
+    n_bad = int(found[-1])
+    js["sanity_problems"] = n_bad
+    if n_bad > A.max_sanity_problems and not A.no_gates:
+        js["status"] = "aborted_sanity"
+        js["note"] = f"{n_bad} sanity problems (allowed {A.max_sanity_problems})"
+        save_state()
+        raise RuntimeError(f"{n_bad} untampered logs fail their own checks (allowed {A.max_sanity_problems}): fix the cause "
+                           f"before detect. After fixing, clear this job's marks with --reset-job {name} and re-run.")
+    say(f"{name}: sanity gate passed ({n_bad} problems, allowed {A.max_sanity_problems})")
+
+
 def run_llm_job(job: dict) -> None:
     name, model, seed, sizing = job["name"], job["model"], job["seed"], job["sizing"]
     rd = RUNS / name
@@ -423,7 +445,8 @@ def run_llm_job(job: dict) -> None:
     save_state()
     safe_bundle(f"after generate ({name})")
 
-    stage(name, f"tamper@{n}", ["tamper"] + cm() + tam_args(), f"{name}: tamper", f"{name}_tamper")
+    tail_t = stage(name, f"tamper@{n}", ["tamper"] + cm() + tam_args(), f"{name}: tamper", f"{name}_tamper")
+    sanity_gate(name, tail_t, js)
     actual = val_neg_dataset(rd)
     say(f"{name}: clean validation logs in dataset = {actual} (need >= 100 for TPR@1%FPR)")
     if sizing and actual < 100 and n < A.n_max and not js.get("regrown"):
@@ -432,7 +455,8 @@ def run_llm_job(job: dict) -> None:
         say(f"{name}: too few clean validation logs -> one regrowth to n={n} (tamper cache is rebuilt)")
         stage(name, f"generate@{n}", ["generate"] + cm() + gen_args(n), f"{name}: generate n={n}", f"{name}_generate")
         js["n_per_family"] = n
-        stage(name, f"tamper@{n}", ["tamper"] + cm() + tam_args(), f"{name}: tamper", f"{name}_tamper")
+        tail_t = stage(name, f"tamper@{n}", ["tamper"] + cm() + tam_args(), f"{name}: tamper", f"{name}_tamper")
+        sanity_gate(name, tail_t, js)
         actual = val_neg_dataset(rd)
     js["val_neg_dataset"] = actual
     save_state()
