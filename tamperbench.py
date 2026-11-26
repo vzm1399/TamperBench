@@ -1775,6 +1775,33 @@ def boot_ci(pos, pcl, neg, ncl, n_boot, seed):
     return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
 
 
+def boot_tpr_ci(pos, pcl, vneg, vcl, n_boot, seed):
+    """v1.1 (F10): 95% percentile intervals for TPR@1%FPR and TPR@5%FPR. Each draw resamples the test positives by
+    cluster AND the clean validation logs (the threshold sample) by cluster, and re-estimates both thresholds from
+    the resampled validation logs, so threshold noise is included. Returns ((lo1, hi1), (lo5, hi5)); NaN if too few
+    draws. The 1% interval is only meaningful when there are many validation logs (caller decides)."""
+    nan2 = (float("nan"), float("nan"))
+    if n_boot <= 0 or len(vneg) == 0 or len(pos) == 0:
+        return nan2, nan2
+    rng = np.random.default_rng(seed)
+
+    def group(vals, cls):
+        g = {}
+        for v, c in zip(vals, cls):
+            g.setdefault(c, []).append(v)
+        return [np.array(x, float) for x in g.values()]
+
+    P, V = group(pos, pcl), group(vneg, vcl)
+    t1, t5 = [], []
+    for _ in range(n_boot):
+        p = np.concatenate([P[i] for i in rng.integers(0, len(P), len(P))])
+        v = np.concatenate([V[i] for i in rng.integers(0, len(V), len(V))])
+        t1.append(float(np.mean(p > np.quantile(v, 0.99))))
+        t5.append(float(np.mean(p > np.quantile(v, 0.95))))
+    ci = lambda x: (float(np.percentile(x, 2.5)), float(np.percentile(x, 97.5)))
+    return ci(t1), ci(t5)
+
+
 def loc_hit(step_scores, positions, k, rng):
     s = np.array(step_scores, float)
     order = np.argsort(-(s + rng.random(len(s)) * 1e-9))
@@ -1843,6 +1870,8 @@ def cmd_evaluate(args):
     notes.append("Adversary levels are NOT strictly ordered per detector: L2 keeps result sizes equal, which can "
                  "make forged results inconsistent with replay (see per-type results).")
     val_neg = {d: np.array([v for v in (val(d, m) for m in meta if m["split"] == "val" and not m["tampered"]) if v == v]) for d in dets}
+    val_neg_cl = {d: [(val(d, m), m["cluster"]) for m in meta if m["split"] == "val" and not m["tampered"] and val(d, m) == val(d, m)]
+                  for d in dets}  # same values, with the task-instance cluster (for the threshold bootstrap, F10)
 
     main = []
     for split in ("test_id", "test_ood_family"):
@@ -1866,9 +1895,18 @@ def cmd_evaluate(args):
                     v = val_neg[d]
                     t1 = float(np.mean(np.array(ps) > np.quantile(v, 0.99))) if len(v) >= 100 else float("nan")
                     t5 = float(np.mean(np.array(ps) > np.quantile(v, 0.95))) if len(v) >= 20 else float("nan")
+                    nan2 = (float("nan"), float("nan"))
+                    c1, c5 = nan2, nan2
+                    if tt in ("T1-T4", "T5") and len(v) >= 20 and val_neg_cl[d]:
+                        vv, vc = zip(*val_neg_cl[d])
+                        c1, c5 = boot_tpr_ci(ps, pc, vv, vc, args.n_boot, 0)
+                        if len(v) < 100:
+                            c1 = nan2  # same rule as the point estimate
                     main.append(dict(detector=d, split=split, level=level, tamper_type=tt, n_pos=len(ps),
-                                     n_neg=len(ns), auroc=a, ci_lo=lo, ci_hi=hi, tpr_at_1fpr=t1, tpr_at_5fpr=t5))
-    cols = ["detector", "split", "level", "tamper_type", "n_pos", "n_neg", "auroc", "ci_lo", "ci_hi", "tpr_at_1fpr", "tpr_at_5fpr"]
+                                     n_neg=len(ns), auroc=a, ci_lo=lo, ci_hi=hi, tpr_at_1fpr=t1, tpr_at_5fpr=t5,
+                                     tpr_at_1fpr_lo=c1[0], tpr_at_1fpr_hi=c1[1], tpr_at_5fpr_lo=c5[0], tpr_at_5fpr_hi=c5[1]))
+    cols = ["detector", "split", "level", "tamper_type", "n_pos", "n_neg", "auroc", "ci_lo", "ci_hi", "tpr_at_1fpr", "tpr_at_5fpr",
+            "tpr_at_1fpr_lo", "tpr_at_1fpr_hi", "tpr_at_5fpr_lo", "tpr_at_5fpr_hi"]
     write_csv(rd / "results_main.csv", main, cols)
     # F6: length control. Same comparison as results_main (test_id) but positives are matched to negatives with the
     # same number of log steps. A detector whose AUROC drops a lot here was mostly reading the log length.
@@ -1900,7 +1938,9 @@ def cmd_evaluate(args):
                      "of steps. len_only / len_dev are detectors that see nothing but the log length; a detector close to them "
                      "(or one that drops under matching) is reading length.")
     nv = max((len(v) for v in val_neg.values()), default=0)
-    notes.append(f"Threshold calibration uses {nv} clean validation logs; TPR@1%FPR is unreliable with < 100.")
+    notes.append(f"Threshold calibration uses {nv} clean validation logs; TPR@1%FPR is unreliable with < 100 (the 1% threshold is "
+                 f"about one validation log). Prefer TPR@5%FPR; its 95% interval (tpr_at_5fpr_lo/hi, T1-T4 and T5 rows) resamples "
+                 f"positives and validation logs by task instance and re-estimates the threshold in every draw.")
 
     # 2x2 diagnostics (test_id): does the detector fire on tampering, or merely on the violation?
     cells = []
@@ -2049,7 +2089,7 @@ def cmd_evaluate(args):
     summ = ["# TamperBench results summary\n", "## Notes\n"] + [f"- {n}\n" for n in notes]
     nn = {s: sum(1 for m in meta if m["split"] == s) for s in ("train", "val", "test_id", "test_ood_family")}
     summ += [f"\nVariants per split: {nn}\n", "\n## Main (test_id, T1-T4)\n",
-             md_table(sel, ["detector", "level", "n_pos", "n_neg", "auroc", "ci_lo", "ci_hi", "tpr_at_5fpr"]),
+             md_table(sel, ["detector", "level", "n_pos", "n_neg", "auroc", "ci_lo", "ci_hi", "tpr_at_5fpr", "tpr_at_5fpr_lo", "tpr_at_5fpr_hi"]),
              "\n## Telemetry tiers (AUROC, test_id, T1-T4)\n", md_table(trows, ["tier", "detector", "L0", "L1", "L2", "L3"]),
              "\n## Length control (test_id, T1-T4): raw vs length-matched AUROC\n",
              md_table([r for r in lc if r["tamper_type"] == "T1-T4"],
