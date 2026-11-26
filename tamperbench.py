@@ -2311,6 +2311,16 @@ def cmd_leakcheck(args):
 # 9b. RUN MANIFEST ("run identity card") and PACK (one zip with everything needed to review a run)
 # =====================================================================================
 _ENV = {}
+_PIP_FREEZE = {"text": None}
+
+
+def _run_quiet(cmd, cwd=None, timeout=30):
+    """Run a helper command, return stdout text or None. Never raises."""
+    try:
+        r = subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
 
 
 def env_info() -> dict:
@@ -2334,6 +2344,27 @@ def env_info() -> dict:
         _ENV["code_sha256_16"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
     except Exception:
         pass
+    # v1.1 (F8): everything that changed results in v1 without being recorded (CPU count affects OpenBLAS limits,
+    # package versions affect replay, uncommitted edits make a commit hash meaningless)
+    try:
+        _ENV["cpu_count"] = os.cpu_count()
+        if hasattr(os, "sched_getaffinity"):
+            _ENV["cpu_affinity"] = len(os.sched_getaffinity(0))
+    except Exception:
+        pass
+    here = str(Path(__file__).resolve().parent)
+    head = _run_quiet(["git", "rev-parse", "HEAD"], cwd=here, timeout=10)
+    if head:
+        _ENV["git_commit"] = head.strip()
+        dirty = _run_quiet(["git", "status", "--porcelain", "--untracked-files=no"], cwd=here, timeout=10)
+        _ENV["git_dirty"] = bool(dirty.strip()) if dirty is not None else None
+    else:
+        _ENV["git_commit"] = None  # not a git checkout (e.g. a copied script)
+    frz = _run_quiet([sys.executable, "-m", "pip", "freeze"], timeout=60)
+    if frz is not None:
+        _PIP_FREEZE["text"] = frz
+        _ENV["pip_freeze_sha256_16"] = hashlib.sha256(frz.encode("utf-8")).hexdigest()[:16]
+        _ENV["pip_n_packages"] = len([x for x in frz.splitlines() if x.strip()])
     return _ENV
 
 
@@ -2343,12 +2374,15 @@ def log_stage(args, stage, t0, status="ok") -> None:
         rd = Path(args.run_dir)
         rd.mkdir(parents=True, exist_ok=True)
         utc = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat(timespec="seconds")
+        info = env_info()
+        if _PIP_FREEZE["text"] is not None and not (rd / "pip_freeze.txt").exists():
+            atomic_write_text(rd / "pip_freeze.txt", _PIP_FREEZE["text"])
         append_jsonl(rd / "manifest.jsonl", dict(
             stage=stage, status=status, started_utc=utc(t0), ended_utc=utc(time.time()),
             seconds=round(time.time() - t0, 1), backend=getattr(args, "backend", None),
             model=(getattr(args, "model", None) if getattr(args, "backend", None) == "hf" else "FAKE-LM (pipeline test)"),
             seed=getattr(args, "seed", None),
-            command=" ".join(sys.argv), env=env_info()))
+            command=" ".join(sys.argv), env=info))
     except Exception as e:  # the manifest must never break a run
         print(f"[manifest] skipped: {e}", flush=True)
 
@@ -2368,7 +2402,7 @@ def cmd_pack(args):
     """Collect the small, reviewable files of a run into ONE zip with unique, folder-prefixed names."""
     rd = Path(args.run_dir)
     name = rd.name
-    files = {rd / n for n in ("manifest.jsonl", "config.json", "errors.log", "summary.md", "summary_swarm.md")
+    files = {rd / n for n in ("manifest.jsonl", "pip_freeze.txt", "config.json", "errors.log", "summary.md", "summary_swarm.md")
              if (rd / n).exists()}
     pats = ["results_*.csv", "figs/*.png"]
     if args.with_episodes:
