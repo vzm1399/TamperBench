@@ -912,6 +912,7 @@ class Ctx:
         self.scrub = set()
         ratios = [s["tokens_out"] / max(len(s["content"]), 1) for s in self.true if s["tokens_out"] > 0]
         self.tok_ratio = float(statistics.median(ratios)) if ratios else 0.0
+        self.tok_ratios = ratios  # v1.1 (F5): fabricated steps sample their token ratio from the real ones (was: the median)
 
     def sample_wall(self, tool):
         """Edited steps get a plausible wall time drawn from the same log (not a constant), so that
@@ -1111,11 +1112,14 @@ def finalize(S, level, ctx):
             if edited(s):
                 refresh_meta(s, ctx.sample_wall(s["tool"]))
                 if s["_orig"] is None:
-                    s["tokens_out"] = int(round(ctx.tok_ratio * len(s["content"])))
+                    r_tok = ctx.rng.choice(ctx.tok_ratios) if ctx.tok_ratios else 0.0
+                    s["tokens_out"] = int(round(r_tok * len(s["content"])))
         for i, s in enumerate(S):
             s["step_id"] = i + 1
             if s["_orig"] is None and i > 0:
-                s["tokens_in"] = S[i - 1]["tokens_in"]
+                p_ = S[i - 1]  # v1.1 (F5): in a real episode the prompt grows by the previous reply + observation
+                s["tokens_in"] = (p_["tokens_in"] + p_["tokens_out"] + max(1, len(p_["result"].encode("utf-8")) // 4)
+                                  if p_["tokens_in"] > 0 else 0)
     else:
         prev = 0
         for s in S:
@@ -2164,6 +2168,83 @@ def cmd_swarm(args):
     return out_rows
 
 
+
+# =====================================================================================
+# 9c. LEAKAGE CHECK (v1.1, F5): do generator artifacts, rather than real inconsistencies, give the edits away?
+# =====================================================================================
+LEAK_FILLER = "\nalpha bravo charlie"   # size_match() pads with "\n" + " ".join(WORDS*4), always the same text
+
+
+def leak_text(log, max_chars=6000) -> str:
+    return "\n".join(f"{s['tool']} | {s['thought']} | {s['result'][:300]}" for s in log)[:max_chars]
+
+
+def leak_filler_count(log) -> float:
+    """Number of results that contain the fixed filler text added by size_match (a generator fingerprint)."""
+    return float(sum(LEAK_FILLER in s["result"] for s in log))
+
+
+def leak_tokens_exact(log) -> float:
+    """Steps whose tokens_out equals round(median ratio * len(content)): fabricated steps are an exact linear function of
+    their length, real steps are noisy."""
+    rs = [s["tokens_out"] / max(len(s["content"]), 1) for s in log if s["tokens_out"] > 0]
+    if not rs:
+        return 0.0
+    r = float(statistics.median(rs))
+    return float(sum(s["tokens_out"] > 0 and s["tokens_out"] == int(round(r * len(s["content"]))) for s in log))
+
+
+def leak_tokens_in_dup(log) -> float:
+    """Steps whose tokens_in equals the previous step's: in a real LM episode the prompt grows at every step."""
+    return float(sum(b["tokens_in"] > 0 and b["tokens_in"] == a["tokens_in"] for a, b in zip(log, log[1:])))
+
+
+def cmd_leakcheck(args):
+    """Needs only dataset.jsonl (no detectors, no GPU). Reports, on the test split, the AUROC of (1) two single-artifact
+    probes and (2) a surface-text classifier (char n-gram TF-IDF + logistic regression, trained like B1 on T1-T4 at L0-L2).
+    A surface-text classifier cannot check consistency, so a high AUROC at L2/L3 means the edits carry generator tells."""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+    rd = Path(args.run_dir)
+    rows = read_jsonl(rd / "dataset.jsonl")
+    if not rows:
+        sys.exit(f"[leakcheck] no dataset.jsonl in {rd}")
+    tr = [r for r in rows if r["split"] == "train" and (not r["tampered"] or
+          (r["tamper_type"] in {"T1", "T2", "T3", "T4"} and r["level"] in (0, 1, 2)))]
+    te = [r for r in rows if r["split"] == "test_id"]
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), max_features=args.max_features, sublinear_tf=True)
+    Xtr = vec.fit_transform([leak_text(r["log"], args.max_chars) for r in tr])
+    clf = LogisticRegression(max_iter=1000, C=1.0, class_weight="balanced").fit(Xtr, [int(r["tampered"]) for r in tr])
+    score = {"ngram_text": lambda r, p: p[r["variant_id"]], "filler_count": lambda r, p: leak_filler_count(r["log"]),
+             "tokens_exact": lambda r, p: leak_tokens_exact(r["log"]),
+             "tokens_in_dup": lambda r, p: leak_tokens_in_dup(r["log"])}
+    p_ng = dict(zip([r["variant_id"] for r in te], clf.decision_function(vec.transform([leak_text(r["log"], args.max_chars) for r in te]))))
+    neg = [r for r in te if not r["tampered"]]
+    out = []
+    for pr, fn in score.items():
+        for tt, tset in TT_GROUPS.items():
+            for lv in LEVELS:
+                pos = [r for r in te if r["tampered"] and r["level"] == lv and r["tamper_type"] in tset]
+                if pos and neg:
+                    out.append(dict(probe=pr, tamper_type=tt, level=lv, n_pos=len(pos), n_neg=len(neg),
+                                    auroc=auroc([fn(r, p_ng) for r in pos], [fn(r, p_ng) for r in neg])))
+    write_csv(rd / "results_leakcheck.csv", out, ["probe", "tamper_type", "level", "n_pos", "n_neg", "auroc"])
+    print(f"[leakcheck] test_id: {len(neg)} untampered logs; positives per level as in results_leakcheck.csv")
+    for pr in score:
+        for tt in ("T1-T4", "T1", "T2", "T3", "T4", "T5"):
+            cells = {o["level"]: o["auroc"] for o in out if o["probe"] == pr and o["tamper_type"] == tt}
+            if cells:
+                print(f"  {pr:13s} {tt:6s} " + "  ".join(f"L{lv}={cells[lv]:.2f}" for lv in sorted(cells)))
+    flags = [o for o in out if o["probe"] != "ngram_text" and o["tamper_type"] == "T1-T4" and o["level"] >= 1
+             and abs(o["auroc"] - 0.5) > 0.10]
+    print("\n[leakcheck] VERDICT single-artifact probes (T1-T4, L1+; |AUROC-0.5| > 0.10 = tell): " +
+          ("TELL FOUND in " + ", ".join(sorted({f"{o['probe']} L{o['level']}={o['auroc']:.2f}" for o in flags}))
+           if flags else "none"))
+    print("[leakcheck] ngram_text is a surface-only baseline: compare it with B1 at L2/L3; if it comes close to B1, a large part "
+          "of B1's score is probably generator artifacts, not detected inconsistency.")
+    return out
+
+
 # =====================================================================================
 # 9b. RUN MANIFEST ("run identity card") and PACK (one zip with everything needed to review a run)
 # =====================================================================================
@@ -2302,6 +2383,11 @@ def build_parser():
         p.add_argument("--rounds", type=int, default=5)
         p.add_argument("--n-boot", type=int, default=200)
 
+    def lk(p):
+        p.add_argument("--run-dir", default="runs/default")
+        p.add_argument("--max-features", type=int, default=60000)
+        p.add_argument("--max-chars", type=int, default=6000)
+
     def pk(p):
         p.add_argument("--run-dir", default="runs/default")
         p.add_argument("--logs", default="", help="comma list of console-log files to include (e.g. gen_pilot.log)")
@@ -2310,7 +2396,7 @@ def build_parser():
 
     for name, fns in [("pack", (pk,)), ("swarm", (swm,)), ("generate", (common, gen)), ("tamper", (common, tam)), ("detect", (common, det)),
                       ("evaluate", (common, ev)), ("all", (common, gen, tam, det, ev)), ("selftest", ()),
-                      ("lmcheck", (common,)), ("status", (common, gen, tam, det))]:
+                      ("lmcheck", (common,)), ("status", (common, gen, tam, det)), ("leakcheck", (lk,))]:
         p = sub.add_parser(name)
         for fn in fns:
             fn(p)
@@ -2428,7 +2514,8 @@ def main():
      "evaluate": lambda: staged(args, "evaluate", lambda: cmd_evaluate(args)),
      "all": lambda: cmd_all(args), "selftest": lambda: cmd_selftest(args),
      "lmcheck": lambda: cmd_lmcheck(args), "swarm": lambda: staged(args, "swarm", lambda: cmd_swarm(args)),
-     "status": lambda: cmd_status(args), "pack": lambda: cmd_pack(args)}[args.cmd]()
+     "status": lambda: cmd_status(args), "pack": lambda: cmd_pack(args),
+     "leakcheck": lambda: cmd_leakcheck(args)}[args.cmd]()
 
 
 if __name__ == "__main__":
