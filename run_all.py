@@ -76,6 +76,8 @@ ap.add_argument("--swarm-episodes", type=int, default=200)
 ap.add_argument("--agent", default="hybrid")
 ap.add_argument("--max-steps", type=int, default=14)
 ap.add_argument("--temperature", type=float, default=0.7)
+ap.add_argument("--violation-mode", choices=["write", "readonly"], default="write",
+                help="forwarded to generate: write (v1 default) or readonly (F7: no file written by the violation)")
 ap.add_argument("--rewrite-with-lm", action=argparse.BooleanOptionalAction, default=True)
 ap.add_argument("--l3-n", type=int, default=8)
 ap.add_argument("--detectors", default="b1,b2,b3,d1,d1abl,u1,d2,d3,v0,len")
@@ -358,7 +360,8 @@ def common(rd: Path, model: str, seed: int):
 
 
 def gen_args(n: int):
-    return ["--agent", A.agent, "--n-per-family", n, "--max-steps", A.max_steps, "--temperature", A.temperature]
+    return ["--agent", A.agent, "--n-per-family", n, "--max-steps", A.max_steps, "--temperature", A.temperature,
+            "--violation-mode", A.violation_mode]
 
 
 def tam_args():
